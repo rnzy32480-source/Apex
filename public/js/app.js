@@ -50,7 +50,7 @@ const state = {
   year: new Date().getFullYear(),
   pickedDate: null,
   commandTab: "desk",
-  login: { username: "chief", password: "ApexPD2026", discord: "chief", rank: "r22", unitCode: "C0A1" },
+  login: { username: "", password: "", discord: "", rank: "", unitCode: "" },
   docForm: { kind: "protocol", code: "", title: "", body: "" },
   staffForm: { username: "", password: "", displayName: "", rank: "r7", civilianId: "", discord: "", unitCode: "" },
   filter: "pending",
@@ -508,28 +508,22 @@ function staffTicketsView() {
 }
 
 function loginView() {
-  const rankOpts = (state.ranks || [])
-    .map((r) => `<option value="${r.id}" ${state.login.rank === r.id ? "selected" : ""}>${r.order}. ${escapeHtml(r.label)}</option>`)
-    .join("");
+  const rankOpts =
+    `<option value="" disabled ${state.login.rank ? "" : "selected"}>Select rank</option>` +
+    (state.ranks || [])
+      .map((r) => `<option value="${r.id}" ${state.login.rank === r.id ? "selected" : ""}>${r.order}. ${escapeHtml(r.label)}</option>`)
+      .join("");
   return `
     <section class="section">
       <div class="kicker">Restricted</div>
       <h2>Staff login</h2>
-      <p class="help">If command already added you to the roster, sign in here with the username, password, Discord, and rank they issued. You do not need to apply first.</p>
-      <div class="cred-card">
-        <span>Chief of Police</span>
-        <strong>Username: chief</strong>
-        <strong>Password: ApexPD2026</strong>
-        <strong>Discord: chief</strong>
-        <strong>Rank: Chief of Police</strong>
-        <strong>Unit code: C0A1</strong>
-      </div>
+      <p class="help">If command already added you to the roster, sign in here with the username, password, Discord, rank, and unit code they issued. You do not need to apply first.</p>
       <form class="stack" id="login-form" autocomplete="off">
         <label>Username <input name="username" value="${escapeHtml(state.login.username)}" autocomplete="username" required /></label>
         <label>Password <input name="password" type="password" value="${escapeHtml(state.login.password)}" autocomplete="current-password" required /></label>
         <label>Discord username <input name="discord" value="${escapeHtml(state.login.discord)}" required /></label>
-        <label>Your rank <select name="rank">${rankOpts}</select></label>
-        <label>Unit code <input name="unitCode" value="${escapeHtml(state.login.unitCode)}" required placeholder="F0A1" /></label>
+        <label>Your rank <select name="rank" required>${rankOpts}</select></label>
+        <label>Unit code <input name="unitCode" value="${escapeHtml(state.login.unitCode)}" required placeholder="Unit code" /></label>
         <button class="btn" type="submit">Sign in</button>
         <p class="muted" id="login-msg"></p>
       </form>
@@ -1142,19 +1136,22 @@ function bind() {
       try {
         const fd = new FormData(loginForm);
         state.login = {
-          username: String(fd.get("username") || ""),
+          username: String(fd.get("username") || "").trim(),
           password: String(fd.get("password") || ""),
-          discord: String(fd.get("discord") || ""),
-          rank: String(fd.get("rank") || ""),
-          unitCode: String(fd.get("unitCode") || ""),
+          discord: String(fd.get("discord") || "").trim(),
+          rank: String(fd.get("rank") || "").trim(),
+          unitCode: String(fd.get("unitCode") || "").trim(),
         };
+        if (msg) msg.textContent = "Signing in…";
         const data = await api("/api/auth/login", { method: "POST", body: JSON.stringify(state.login) });
         state.token = data.token;
         localStorage.setItem(STAFF_KEY, data.token);
         await loadMe();
+        if (!state.me) throw new Error("Signed in, but the session did not load. Refresh and try again.");
+        location.hash = "#command";
         await render();
       } catch (err) {
-        msg.textContent = err.message;
+        if (msg) msg.textContent = err.message;
       }
     });
   }
