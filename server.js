@@ -72,9 +72,83 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
 }
 
 function verifyPassword(password, stored) {
-  const [salt, hash] = stored.split(":");
-  const next = crypto.scryptSync(password, salt, 32).toString("hex");
-  return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(next, "hex"));
+  try {
+    const [salt, hash] = String(stored || "").split(":");
+    if (!salt || !hash) return false;
+    const next = crypto.scryptSync(String(password || ""), salt, 32).toString("hex");
+    const a = Buffer.from(hash, "hex");
+    const b = Buffer.from(next, "hex");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+const CHIEF_LOGIN = {
+  username: "chief",
+  password: "ApexPD2026",
+  discord: "chief",
+  rank: "r22",
+  unitCode: "C0A1",
+};
+
+function normalizeUnitCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/O/g, "0");
+}
+
+function rankMatches(submitted, user, db) {
+  const raw = String(submitted || "").trim();
+  if (!raw || !user?.rank) return false;
+  if (raw === user.rank) return true;
+  const mine = (db.ranks || []).find((r) => r.id === user.rank);
+  if (!mine) return false;
+  if (raw === String(mine.order)) return true;
+  return raw.toLowerCase() === String(mine.label || "").toLowerCase();
+}
+
+function ensureChiefAccount(db) {
+  if (!Array.isArray(db.staff)) db.staff = [];
+  let chief = db.staff.find((s) => s.id === "staff-chief" || String(s.username || "").toLowerCase() === CHIEF_LOGIN.username);
+  if (!chief) {
+    chief = {
+      id: "staff-chief",
+      username: CHIEF_LOGIN.username,
+      displayName: "Department Chief",
+      rank: CHIEF_LOGIN.rank,
+      discord: CHIEF_LOGIN.discord,
+      unitCode: CHIEF_LOGIN.unitCode,
+      password: hashPassword(CHIEF_LOGIN.password),
+      createdAt: new Date().toISOString(),
+    };
+    db.staff.push(chief);
+    return true;
+  }
+  let changed = false;
+  if (chief.username !== CHIEF_LOGIN.username) {
+    chief.username = CHIEF_LOGIN.username;
+    changed = true;
+  }
+  if (chief.rank !== CHIEF_LOGIN.rank) {
+    chief.rank = CHIEF_LOGIN.rank;
+    changed = true;
+  }
+  if (normalizeDiscord(chief.discord) !== CHIEF_LOGIN.discord) {
+    chief.discord = CHIEF_LOGIN.discord;
+    changed = true;
+  }
+  if (normalizeUnitCode(chief.unitCode) !== CHIEF_LOGIN.unitCode) {
+    chief.unitCode = CHIEF_LOGIN.unitCode;
+    changed = true;
+  }
+  if (!verifyPassword(CHIEF_LOGIN.password, chief.password)) {
+    chief.password = hashPassword(CHIEF_LOGIN.password);
+    changed = true;
+  }
+  return changed;
 }
 
 function signToken(payload) {
@@ -278,11 +352,14 @@ function loadDb() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(DB_PATH)) {
     const seeded = seedDb();
+    ensureChiefAccount(seeded);
     fs.writeFileSync(DB_PATH, JSON.stringify(seeded, null, 2));
     return seeded;
   }
   const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-  if (migrate(db)) saveDb(db);
+  const migrated = migrate(db);
+  const chiefFixed = ensureChiefAccount(db);
+  if (migrated || chiefFixed) saveDb(db);
   return db;
 }
 
@@ -524,13 +601,25 @@ function staffPayload(user, db) {
 }
 
 const loginHits = new Map();
-function tooManyTries(key, max = 8, windowMs = 15 * 60 * 1000) {
+function loginBlocked(key, max = 20, windowMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  const fresh = (loginHits.get(key) || []).filter((t) => now - t < windowMs);
+  loginHits.set(key, fresh);
+  return fresh.length >= max;
+}
+function recordLoginFail(key) {
   const now = Date.now();
   const row = loginHits.get(key) || [];
-  const fresh = row.filter((t) => now - t < windowMs);
-  fresh.push(now);
-  loginHits.set(key, fresh);
-  return fresh.length > max;
+  row.push(now);
+  loginHits.set(key, row);
+}
+function clearLoginFails(key) {
+  loginHits.delete(key);
+}
+function tooManyTries(key, max = 8, windowMs = 15 * 60 * 1000) {
+  if (loginBlocked(key, max, windowMs)) return true;
+  recordLoginFail(key);
+  return loginBlocked(key, max, windowMs);
 }
 
 function normalizeEmail(value) {
@@ -718,27 +807,33 @@ app.get("/api/meta", (_req, res) => {
 app.post("/api/auth/login", (req, res) => {
   const { username, password, discord, rank, unitCode } = req.body || {};
   const ip = clientIp(req);
-  if (tooManyTries(`staff:${ip}`)) return res.status(429).json({ error: "Too many sign-in tries. Wait 15 minutes." });
+  const hitKey = `staff:${ip}`;
+  if (loginBlocked(hitKey)) return res.status(429).json({ error: "Too many sign-in tries. Wait 15 minutes." });
   const db = loadDb();
-  const user = db.staff.find((s) => s.username.toLowerCase() === String(username || "").toLowerCase());
-  if (!user || !verifyPassword(String(password || ""), user.password)) {
-    return res.status(401).json({ error: "Invalid credentials" });
-  }
+  const user = db.staff.find((s) => s.username.toLowerCase() === String(username || "").trim().toLowerCase());
   const disc = normalizeDiscord(discord);
+  const code = normalizeUnitCode(unitCode);
+  const fail = (msg) => {
+    recordLoginFail(hitKey);
+    return res.status(401).json({ error: msg });
+  };
+  if (!user || !verifyPassword(String(password || ""), user.password)) {
+    return fail("Invalid username or password");
+  }
   if (!disc) return res.status(400).json({ error: "Discord username is required" });
   if (user.discord && normalizeDiscord(user.discord) !== disc) {
-    return res.status(401).json({ error: "Discord username does not match this staff file" });
+    return fail("Discord username does not match this staff file");
   }
   if (!user.discord) user.discord = disc;
-  if (!rank || rank !== user.rank) {
-    return res.status(401).json({ error: "Selected rank does not match your issued rank" });
+  if (!rankMatches(rank, user, db)) {
+    return fail("Selected rank does not match your issued rank");
   }
-  const code = String(unitCode || "").trim().toUpperCase();
   if (!code) return res.status(400).json({ error: "Unit code is required" });
-  if ((user.unitCode || "").toUpperCase() !== code) {
-    return res.status(401).json({ error: "Unit code does not match this officer file" });
+  if (normalizeUnitCode(user.unitCode) !== code) {
+    return fail("Unit code does not match this officer file");
   }
   saveDb(db);
+  clearLoginFails(hitKey);
   const token = signToken({ sid: user.id, kind: "staff", exp: Date.now() + TOKEN_TTL_MS });
   res.json({ token, ...staffPayload(user, db) });
 });
@@ -1789,5 +1884,4 @@ app.patch("/api/tickets/:id", auth, (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Axel Town PD portal running at http://localhost:${PORT}`);
-  console.log("Command login — username: chief  password: ApexPD2026");
 });
